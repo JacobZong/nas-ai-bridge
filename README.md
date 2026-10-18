@@ -52,6 +52,12 @@ PR 與 push 只跑測試，不發布。
 NAS Docker → 專案 `filesystem-mcp` → 重新部署並勾「拉取最新映像」。部署後跑
 `nas_mcp_check.py --e2e`（在 `nas-mcp-remote-access` Skill 內）。
 
+## frpc（刻意不做成映像）
+
+frpc 是整條連線的入口：它一斷，WebDAV 與 MCP 同時斷，而且只能在家中區網修。所以它在 NAS 上是獨立專案 `docker/frpc/`
+（alpine:3.20 ＋ 官方 frp **0.57.0** 執行檔），不跟 MCP 一起更新或重新部署；本 repo 只保存它的設定範本 `deploy/nas/frpc/frpc.toml`。
+frpc 要和 Vultr 的 frps（同為 0.57.0）配對升級，兩邊在同一次維護裡一起換。
+
 ## 授權
 
 本 repo 自己的檔案以 MIT 授權；`mcp/` 保留上游的 `LICENSE`。上游清單見 `NOTICE`。
