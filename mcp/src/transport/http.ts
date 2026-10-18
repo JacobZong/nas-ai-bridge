@@ -1,0 +1,386 @@
+// HTTP hosting: express app assembly, security middleware wiring, the modern
+// per-request server factory, and listen-filter watcher gating on POST /mcp.
+import {
+  hostHeaderValidation,
+  localhostOriginValidation,
+  originValidation,
+} from '@modelcontextprotocol/express';
+import { toNodeHandler } from '@modelcontextprotocol/node';
+import type { McpHttpHandler, ServerNotifier } from '@modelcontextprotocol/server';
+import {
+  createMcpHandler,
+  DEFAULT_REQUEST_TIMEOUT_MSEC,
+  isJsonContentType,
+  ProtocolErrorCode,
+} from '@modelcontextprotocol/server';
+
+import type { Server } from 'node:http';
+import { createServer as createHttpServer } from 'node:http';
+
+import express from 'express';
+import type { Express, NextFunction, Request, Response } from 'express';
+
+import { formatUnknownErrorMessage } from '../core/errors.ts';
+import { Logger } from '../core/observability.ts';
+import { PathGuard } from '../core/path.ts';
+import type { ServerOptions } from '../core/path.ts';
+import { PageSnapshotStore, ResourceStore } from '../core/store.ts';
+import { getMaxInboundMessageBytes, parseEnvInt, parseTrueEnvFlag } from '../core/util.ts';
+import { createWatcherRegistry, type WatcherRegistry } from '../core/watcher-registry.ts';
+import { createServer } from '../server.ts';
+import {
+  assertHttpBindingPolicy,
+  assertHttpHostPolicy,
+  bearerAuthMiddleware,
+  computeAllowedOriginHostnames,
+  corsMiddleware,
+  createRateLimiter,
+  isLoopbackHttpHost,
+  JSONRPC_SERVER_ERROR,
+  protectedResourceUrl,
+  resolveAllowedHosts,
+  resolveTrustProxySetting,
+  sendJsonRpcError,
+} from './http-policy.ts';
+import type { RuntimeConfig } from './shared.ts';
+import { jsonRpcRequestId, listenSubscriptionUris, prepareListenWatchers } from './shared.ts';
+
+// Must exceed the idle timeout of any proxy in front of this server, or the
+// proxy reuses connections the server already closed (intermittent 502s).
+const KEEPALIVE_TIMEOUT_MS = 5_000;
+
+/** Body-parser rejections and anything else that reaches the end of the chain. */
+function errorHandlerMiddleware(
+  err: Error & { status?: number },
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  if (res.headersSent) {
+    next(err);
+    return;
+  }
+  if (err.status === 413) {
+    sendJsonRpcError(
+      res,
+      413,
+      ProtocolErrorCode.InvalidRequest,
+      `Request body too large: the limit is ${String(getMaxInboundMessageBytes())} bytes (3 × FS_MAX_FILE_SIZE + 1 MiB). Split the write into smaller calls.`,
+    );
+    return;
+  }
+  if (err.status === 400) {
+    sendJsonRpcError(res, 400, ProtocolErrorCode.ParseError, 'Invalid JSON in request body');
+    return;
+  }
+  Logger.error('[HTTP] Unhandled middleware error:', formatUnknownErrorMessage(err));
+  sendJsonRpcError(res, 500, ProtocolErrorCode.InternalError, 'Internal Server Error');
+}
+
+function setupExpressApp(
+  httpHost: string,
+  apiKey: string | undefined,
+  allowedHosts: string[],
+  modernNodeHandler: (req: Request, res: Response, parsedBody?: unknown) => Promise<void>,
+  sharedPathGuard: PathGuard,
+  sharedRegistry: WatcherRegistry,
+  notifier: ServerNotifier,
+): Express {
+  const allowedOriginHostnames = computeAllowedOriginHostnames(process.env['FS_ALLOWED_ORIGINS']);
+  // Read once here and passed down, like every other env-derived policy input:
+  // http-policy holds no state and reads no env of its own.
+  const publicUrl = process.env['FS_PUBLIC_URL'];
+
+  // Assembled from the SDK's own gates rather than `createMcpExpressApp`,
+  // which mounts `express.json()` for the whole app: that would parse every
+  // body before the rate limiter and bearer auth below can refuse it. Host
+  // and Origin validation still run first and app-wide, mounted by the same
+  // rules `createMcpExpressApp` applies to these inputs.
+  const app = express();
+  if (allowedHosts.length > 0) app.use(hostHeaderValidation(allowedHosts));
+  if (allowedOriginHostnames.length > 0) {
+    app.use(originValidation(allowedOriginHostnames));
+  } else if (isLoopbackHttpHost(httpHost)) {
+    // An all-blank FS_ALLOWED_ORIGINS on a loopback bind keeps the localhost
+    // default (see isOriginAllowed in http-policy.ts).
+    app.use(localhostOriginValidation());
+  }
+
+  const trustProxy = resolveTrustProxySetting(process.env['FS_TRUST_PROXY']);
+  if (trustProxy !== undefined) {
+    app.set('trust proxy', trustProxy);
+  }
+
+  if (allowedHosts.length === 0) {
+    Logger.warn(
+      '[HTTP] FS_ALLOW_UNRESTRICTED_HOSTS is set: binding globally without Host validation.',
+    );
+  }
+
+  app.use('/mcp', corsMiddleware(allowedOriginHostnames));
+
+  // Unconditional: the spec's rate-limit MUST is not scoped to authenticated
+  // binds. A keyless bind is loopback-only, so the cap is looser, not absent.
+  const rpm = parseEnvInt('FS_RATE_LIMIT_RPM', apiKey ? 120 : 6_000, 1, 100_000);
+  app.use('/mcp', createRateLimiter(rpm));
+
+  if (apiKey && allowedHosts.length > 0) {
+    const metadataHandler = (req: Request, res: Response): void => {
+      const resource = protectedResourceUrl(req, true, publicUrl);
+      if (!resource) {
+        // Unreachable for the unrestricted case (the gate above excludes it),
+        // but defend a FS_PUBLIC_URL parse failure with a bodyless
+        // 404 — a generic OAuth client cannot parse a JSON-RPC error envelope.
+        res.status(404).end();
+        return;
+      }
+      res.header('Access-Control-Allow-Origin', '*');
+      res.status(200).json({
+        resource: resource.href,
+        bearer_methods_supported: ['header'],
+        resource_name: 'filesystem-mcp',
+      });
+    };
+    app.get(
+      ['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp'],
+      metadataHandler,
+    );
+  }
+
+  app.get('/healthz', (_req: Request, res: Response) => {
+    res.status(200).json({
+      status: 'ok',
+      uptime: process.uptime(),
+    });
+  });
+
+  app.use('/mcp', bearerAuthMiddleware(apiKey, allowedHosts.length > 0, publicUrl));
+
+  const resourceUpdateSink = (uri: string): void => {
+    notifier.resourceUpdated(uri);
+  };
+
+  // One bound for both transports, derived from the write tools' own limit
+  // (getMaxInboundMessageBytes): a create the schema accepts must not be
+  // refused here. Mounted after CORS, the rate limiter and auth, so a refused
+  // request is answered without its body being read. The SDK's handler and
+  // adapter get the same number below so their internal defaults (4 MiB)
+  // cannot disagree with this parser, although both only read a body when no
+  // parsedBody is supplied — which this route never does.
+  const parseJson = express.json({ limit: `${String(getMaxInboundMessageBytes())}b` });
+
+  app.post('/mcp', parseJson, (req: Request, res: Response, next: NextFunction) => {
+    void (async () => {
+      if (!isJsonContentType(req.headers['content-type'])) {
+        sendJsonRpcError(
+          res,
+          415,
+          JSONRPC_SERVER_ERROR,
+          'Unsupported Media Type: Content-Type must be application/json',
+        );
+        return;
+      }
+      const parsedBody = req.body as unknown;
+      if (parsedBody === undefined) {
+        // Undefined tells the Node adapter to read the raw stream without our parser's limit.
+        sendJsonRpcError(res, 400, ProtocolErrorCode.ParseError, 'Invalid JSON in request body');
+        return;
+      }
+      // Only a structurally valid listen gets watchers, mirroring the stdio
+      // gate. A malformed one cannot succeed downstream, so attaching handles
+      // for it only gives the response-close release something to undo — and
+      // everything that is not a listen takes no watchers either way.
+      const requestedUris = listenSubscriptionUris(parsedBody);
+      if (requestedUris === undefined) {
+        await modernNodeHandler(req, res, parsedBody);
+        return;
+      }
+
+      // Over-cap listens are rejected inside prepareListenWatchers, before the ack.
+      const prepared = await prepareListenWatchers(
+        requestedUris,
+        sharedPathGuard,
+        sharedRegistry,
+        resourceUpdateSink,
+      );
+      if (!prepared.ok) {
+        sendJsonRpcError(
+          res,
+          400,
+          ProtocolErrorCode.InvalidParams,
+          prepared.message,
+          jsonRpcRequestId(parsedBody),
+        );
+        return;
+      }
+
+      let released = false;
+      const release = (): void => {
+        if (released) return;
+        released = true;
+        for (const uri of prepared.acquiredUris) sharedRegistry.release(uri);
+      };
+      if (prepared.acquiredUris.length > 0) {
+        // The attach loop awaits per-URI path validation, so the client can be
+        // gone by the time it returns. `close` fires once: a listener attached
+        // after it would never run and every lease this batch took would leak
+        // until process shutdown.
+        if (res.closed || res.destroyed || res.writableEnded) release();
+        else res.once('close', release);
+      }
+
+      try {
+        await modernNodeHandler(req, res, parsedBody);
+      } catch (error) {
+        release();
+        throw error;
+      }
+    })().catch(next);
+  });
+
+  // Answer non-POST here rather than handing it to `modernNodeHandler`. The
+  // SDK's own 405 is byte-identical to this one, but it omits the `Allow`
+  // header RFC 9110 §15.5.6 requires and routes every routine GET probe through
+  // the handler's `onerror` — which this server logs at error level.
+  app.all('/mcp', (_req: Request, res: Response) => {
+    sendJsonRpcError(res, 405, JSONRPC_SERVER_ERROR, 'Method not allowed.', null, {
+      Allow: 'POST, OPTIONS',
+    });
+  });
+
+  app.use(errorHandlerMiddleware);
+
+  return app;
+}
+
+export async function startHttpServer(
+  port: number,
+  options: ServerOptions,
+  config: RuntimeConfig = {},
+): Promise<Server> {
+  const httpHost = config.httpHost ?? '127.0.0.1';
+  const { apiKey } = config;
+  assertHttpBindingPolicy(httpHost, apiKey);
+  const allowedHosts = resolveAllowedHosts(httpHost, process.env['FS_ALLOWED_HOSTS']);
+  assertHttpHostPolicy(
+    httpHost,
+    allowedHosts,
+    parseTrueEnvFlag(process.env['FS_ALLOW_UNRESTRICTED_HOSTS'], 'FS_ALLOW_UNRESTRICTED_HOSTS'),
+  );
+
+  const sharedRegistry = createWatcherRegistry();
+  // One store for the whole endpoint, same lifetime and same one-credential
+  // trust argument as the shared guard below: a result a tool externalized in
+  // one POST must survive to the follow-up resources/read, and the modern leg
+  // builds a fresh McpServer per request so a per-request store would discard
+  // it immediately.
+  // Fires only from a tool call, which is long after `modernHandler` below is
+  // constructed, so reading it from the closure is safe.
+  const sharedStore = new ResourceStore(() => {
+    modernHandler.notify.resourcesChanged();
+  });
+  const sharedPageStore = new PageSnapshotStore();
+  // One guard for the whole endpoint. The modern leg builds a fresh McpServer
+  // per request, so a per-instance guard would discard every accepted access
+  // grant the moment the request ended — re-prompting on each subsequent call
+  // and leaving the listen-watcher path validating against a stale allowed set.
+  // Grant scope is therefore the endpoint, not the connection: with FS_API_KEY set
+  // every caller presents the same key (one auth context by construction), and
+  // without it the bind is loopback-only. Split into per-auth-context guards if
+  // this ever serves more than one credential.
+  const sharedPathGuard = new PathGuard(options);
+  await sharedPathGuard.recomputeAllowedDirectories();
+
+  const maxRequestBodySize = getMaxInboundMessageBytes();
+
+  const modernHandler: McpHttpHandler = createMcpHandler(
+    async ({ era }) => {
+      const c = await createServer(options, {
+        watcherRegistry: sharedRegistry,
+        notifier: modernHandler.notify,
+        pathGuard: sharedPathGuard,
+        resourceStore: sharedStore,
+        pageStore: sharedPageStore,
+        era,
+        transport: 'http',
+        cacheScope: apiKey ? 'private' : 'public',
+      });
+      return c.mcp;
+    },
+    {
+      // The SDK's default: a 2025-era request is answered by a fresh instance
+      // from the same factory, no session. What that leg cannot do — answer an
+      // input_required confirmation, deliver a subscription — is refused with a
+      // named workaround (define.ts, resources.ts). See docs/adr/003.
+      legacy: 'stateless',
+      maxRequestBodySize,
+      onerror: (error: Error) => {
+        Logger.error('[HTTP] modern leg error:', formatUnknownErrorMessage(error));
+      },
+    },
+  );
+  const modernNodeHandler = toNodeHandler(modernHandler, {
+    maxRequestBodySize,
+    // The adapter answers 500 when request conversion or handler.fetch
+    // itself throws (e.g. a request racing handler.close()); the entry's
+    // own onerror above never sees those. Log the adapter-level refusal so
+    // the 500 is not silent.
+    onerror: (error: Error) => {
+      Logger.error('[HTTP] node adapter error:', formatUnknownErrorMessage(error));
+    },
+  });
+
+  const app = setupExpressApp(
+    httpHost,
+    apiKey,
+    allowedHosts,
+    modernNodeHandler,
+    sharedPathGuard,
+    sharedRegistry,
+    modernHandler.notify,
+  );
+
+  const httpServer = createHttpServer(app);
+  httpServer.keepAliveTimeout = KEEPALIVE_TIMEOUT_MS;
+  httpServer.headersTimeout = KEEPALIVE_TIMEOUT_MS + 5_000;
+  httpServer.requestTimeout = DEFAULT_REQUEST_TIMEOUT_MSEC;
+
+  const onHttpServerError = (error: Error): void => {
+    Logger.error('[HTTP] runtime server error', {
+      host: httpHost,
+      port,
+      error: formatUnknownErrorMessage(error),
+    });
+  };
+  httpServer.on('error', onHttpServerError);
+
+  const teardown = (): Promise<void> => {
+    sharedRegistry.destroy();
+    sharedPageStore.clear();
+    sharedStore.clear();
+    return modernHandler.close().catch((err: unknown) => {
+      Logger.error('[HTTP] Error closing handler:', formatUnknownErrorMessage(err));
+    });
+  };
+  const originalClose = httpServer.close.bind(httpServer);
+  httpServer.close = function (callback?: (error?: Error) => void) {
+    void teardown().then(() => {
+      originalClose(callback);
+    });
+    return httpServer;
+  };
+
+  return new Promise((resolve, reject) => {
+    const onError = (err: Error) => {
+      void teardown();
+      reject(err);
+    };
+    httpServer.once('error', onError);
+
+    httpServer.listen(port, httpHost, () => {
+      httpServer.removeListener('error', onError);
+      Logger.info(`[HTTP] Server listening on http://${httpHost}:${port}`);
+      resolve(httpServer);
+    });
+  });
+}

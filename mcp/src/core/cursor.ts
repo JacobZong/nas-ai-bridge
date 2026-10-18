@@ -1,0 +1,151 @@
+import { ErrorCode, isFsError } from './errors.ts';
+import type { PageSnapshot, PageSnapshotStore } from './store.ts';
+import { invalidCursor } from './store.ts';
+
+interface PageCursor {
+  readonly snapshotId: string;
+  readonly offset: number;
+}
+
+function encodePageCursor(cursor: PageCursor): string {
+  return Buffer.from(JSON.stringify(cursor)).toString('base64url');
+}
+
+function pageResult<T, M>(
+  snapshotId: string,
+  offset: number,
+  pageSize: number,
+  snapshot: PageSnapshot<T, M>,
+): Page<T, M> {
+  if (offset >= snapshot.items.length) throw invalidCursor();
+  const page = snapshot.items.slice(offset, offset + pageSize);
+  const nextOffset = offset + page.length;
+  return {
+    page,
+    metadata: snapshot.metadata,
+    offset,
+    nextCursor:
+      nextOffset < snapshot.items.length
+        ? encodePageCursor({ snapshotId, offset: nextOffset })
+        : undefined,
+  };
+}
+
+/**
+ * The full result set a paged tool produced, before slicing. `truncated` is the
+ * engine's own stop state — the hard result cap or a timeout cut the set — and
+ * says nothing about page size.
+ */
+export interface ProducedPage<T, M> {
+  readonly items: readonly T[];
+  readonly metadata: M;
+  readonly truncated: boolean;
+}
+
+interface Page<T, M> {
+  readonly page: readonly T[];
+  readonly metadata: M;
+  readonly nextCursor: string | undefined;
+  /**
+   * Index of this page's first item in the full set. A tool that reports
+   * progress in its text needs it: without it every page can only say how many
+   * rows it holds, which is the same number on page 1 and page 9.
+   */
+  readonly offset: number;
+}
+
+export interface PaginatedPage<T, M, R> extends Page<T, M> {
+  /** The externalized full set. First page only, and only when incomplete. */
+  readonly resource?: R;
+}
+
+/**
+ * A paged query's snapshot identity: `method` plus every arg except
+ * `pagingFields`. Result-defining args are in the key by default, so one a tool
+ * forgets to exclude fails loud as an invalid cursor instead of replaying a
+ * stale snapshot.
+ */
+export function pageQueryKey<A extends object>(
+  method: string,
+  args: A,
+  pagingFields: readonly (keyof A & string)[],
+): string {
+  // Sorted: an omitted optional arg the tool fills in (e.g. path) must key the
+  // same as the caller spelling it out, whatever slot the spread lands it in.
+  const kept = Object.entries(args)
+    .filter(([key]) => !pagingFields.includes(key as keyof A & string))
+    .sort(([a], [b]) => a.localeCompare(b));
+  return JSON.stringify({ method, ...Object.fromEntries(kept) });
+}
+
+/**
+ * The one replay-or-produce branch every paged tool runs. A cursor replays a
+ * stored snapshot; without one, `produce` runs the query and its result is
+ * snapshotted for later pages.
+ *
+ * The response is incomplete when the set spans more than one page or the
+ * engine truncated it. Then — and only on the first page — `externalize`
+ * stores the full set and its handle rides back as `resource`. Replayed pages
+ * never carry it: the stored entry expires on the resource store's own TTL and
+ * LRU, not this snapshot's, so replaying its URI would hand back a dead
+ * pointer. Nor do they mint a new one; the set was already stored whole.
+ */
+export async function paginate<T, M, R>(params: {
+  store: PageSnapshotStore;
+  /** Built by `pageQueryKey`; a snapshot replays only for the key that minted it. */
+  queryKey: string;
+  cursor: string | undefined;
+  pageSize: number;
+  produce: () => Promise<ProducedPage<T, M>>;
+  externalize?: ((items: readonly T[], metadata: M) => R) | undefined;
+}): Promise<PaginatedPage<T, M, R>> {
+  if (params.cursor !== undefined) {
+    const decoded = decodePageCursor(params.cursor);
+    const snapshot = params.store.read<T, M>(decoded.snapshotId, params.queryKey);
+    return pageResult(decoded.snapshotId, decoded.offset, params.pageSize, snapshot);
+  }
+  const produced = await params.produce();
+  const { items, metadata } = produced;
+  const incomplete = items.length > params.pageSize || produced.truncated;
+  const first: Page<T, M> =
+    items.length <= params.pageSize
+      ? { page: items, metadata, nextCursor: undefined, offset: 0 }
+      : pageResult(
+          params.store.create({
+            queryKey: params.queryKey,
+            items,
+            metadata,
+          }),
+          0,
+          params.pageSize,
+          { items, metadata },
+        );
+  if (!incomplete || params.externalize === undefined) return first;
+  try {
+    return { ...first, resource: params.externalize(produced.items, produced.metadata) };
+  } catch (error) {
+    // The store refuses an entry over its byte cap. The page itself is
+    // fine; the caller simply gets no full-set resource for this query.
+    if (isFsError(error) && error.code === ErrorCode.TOO_LARGE) return first;
+    throw error;
+  }
+}
+
+function decodePageCursor(cursor: string): PageCursor {
+  try {
+    const text = Buffer.from(cursor, 'base64url').toString('utf-8');
+    const parsed = JSON.parse(text) as { snapshotId?: unknown; offset?: unknown };
+    if (
+      typeof parsed.snapshotId === 'string' &&
+      parsed.snapshotId.length > 0 &&
+      typeof parsed.offset === 'number' &&
+      Number.isInteger(parsed.offset) &&
+      parsed.offset >= 0
+    ) {
+      return { snapshotId: parsed.snapshotId, offset: parsed.offset };
+    }
+    throw new Error('Invalid page cursor');
+  } catch {
+    throw invalidCursor();
+  }
+}

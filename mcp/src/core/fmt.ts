@@ -1,0 +1,197 @@
+import { basename } from 'node:path';
+
+import { MAX_SEARCH_RESULTS } from './util.ts';
+
+export interface ProgressCtx {
+  label: string;
+  subject?: string;
+  scope?: string;
+  current?: number;
+  total?: number;
+  detail?: string;
+  error?: string;
+}
+
+type Phase = 'tick' | 'done' | 'fail';
+
+function buildBody(ctx: ProgressCtx, phase: Phase): string {
+  const items: string[] = [];
+  if (ctx.subject) {
+    items.push(ctx.subject);
+  }
+
+  switch (phase) {
+    case 'tick':
+      if (ctx.current !== undefined && ctx.total !== undefined) {
+        items.push(`${ctx.current}/${ctx.total}`);
+      } else if (ctx.current !== undefined) {
+        items.push(String(ctx.current));
+      }
+      break;
+    case 'done':
+      if (ctx.scope) {
+        items.push(ctx.scope);
+      }
+      if (ctx.detail) {
+        items.push(ctx.detail);
+      }
+      break;
+    case 'fail':
+      if (ctx.error) {
+        items.push(ctx.error);
+      }
+      break;
+  }
+
+  return items.join(' · ');
+}
+
+export function plainMessage(phase: Phase, ctx: ProgressCtx): string {
+  const body = buildBody(ctx, phase);
+  return body ? `${ctx.label}: ${body}` : `${ctx.label}:`;
+}
+
+export function formatCount(count: number, singular: string, plural = `${singular}s`): string {
+  return `${String(count)} ${count === 1 ? singular : plural}`;
+}
+
+const SIZE_UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+
+/** Human-readable byte size for tree lines and summary text: `5 B`, `1 KiB`, `1.5 KiB`, `20 KiB`. */
+export function formatByteSize(bytes: number): string {
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < SIZE_UNITS.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  let rounded = unit === 0 || value >= 10 ? Math.round(value) : Math.round(value * 10) / 10;
+  if (rounded >= 1024 && unit < SIZE_UNITS.length - 1) {
+    rounded = 1;
+    unit++;
+  }
+  return `${String(rounded)} ${SIZE_UNITS[unit]}`;
+}
+
+/**
+ * Short label for a path in summary text. `basename` returns '' for a root
+ * (`C:\`, `/`) and for a trailing-slash path, which rendered as a bare
+ * separator in the per-path summaries, so fall back to the full path.
+ */
+export function pathLabel(path: string): string {
+  return basename(path) || path;
+}
+
+/** Names past this point are noise in a summary line; structuredContent holds them all. */
+const MAX_ROSTER_ITEMS = 20;
+
+/**
+ * Join a per-path summary roster, capped. A 1000-path delete would otherwise
+ * name every entry in the text block that `structuredContent` already carries
+ * in full.
+ */
+export function joinRoster(items: readonly string[], separator = ' · '): string {
+  if (items.length <= MAX_ROSTER_ITEMS) return items.join(separator);
+  const shown = items.slice(0, MAX_ROSTER_ITEMS).join(separator);
+  return `${shown}${separator}+${String(items.length - MAX_ROSTER_ITEMS)} more`;
+}
+
+export function truncateProgressPattern(pattern: string): string {
+  return pattern.length <= 40 ? pattern : `${pattern.slice(0, 40)}…`;
+}
+
+/**
+ * `stoppedReason` names the engine's own cap, and `maxResults` is also the name
+ * of the caller's page-size argument — spelling the cap out keeps a caller who
+ * passed `maxResults: 5` from reading their own argument back.
+ */
+const STOP_REASON_TEXT: Record<string, string> = {
+  maxResults: `hit the server's ${String(MAX_SEARCH_RESULTS)}-result scan cap, not your maxResults`,
+  timeout: 'hit the time limit, or the request was cancelled',
+};
+
+/**
+ * The `//` lines a paged search appends to its text block. Paging, the
+ * engine's stop state and the files it skipped live in the structured half,
+ * which `defineTool` ships under `_meta` for a tool that authors its own text —
+ * and no client renders that. These lines are the only place a caller learns
+ * that more remains, that the scan was cut, or that files went unexamined (a
+ * lone match in an oversized file otherwise reads as "No matches"). They are
+ * independent: a scan can stop early with too few results to page, so a
+ * truncation with no cursor must still say so. Prefixed `//` so none can be
+ * mistaken for a result row.
+ */
+export function pageTrailer(p: {
+  offset: number;
+  shown: number;
+  total: number;
+  noun: string;
+  tool: string;
+  nextCursor?: string | undefined;
+  /** The call's own arguments; printed merged with the cursor so the hint is sendable as-is. */
+  nextArgs?: Record<string, unknown> | undefined;
+  stoppedReason?: string | undefined;
+  skippedTooLarge?: number | undefined;
+  skippedInaccessible?: number | undefined;
+}): string {
+  const lines: string[] = [];
+  // Position is owed on every page of a split set, including the last one —
+  // which has no cursor and would otherwise read as the whole answer.
+  if (p.offset > 0 || p.total > p.shown) {
+    const next =
+      p.nextCursor === undefined
+        ? ''
+        : ` Next page: ${p.tool} ${JSON.stringify({ ...p.nextArgs, cursor: p.nextCursor })}`;
+    lines.push(
+      `// showing ${String(p.offset + 1)}-${String(p.offset + p.shown)} of ${String(p.total)} ${p.noun}.${next}`,
+    );
+  }
+  if (p.stoppedReason !== undefined) lines.push(stoppedEarlyLine(p.stoppedReason));
+  const skipped = [
+    p.skippedTooLarge ? `${formatCount(p.skippedTooLarge, 'file')} over the text size limit` : '',
+    p.skippedInaccessible ? formatCount(p.skippedInaccessible, 'inaccessible file') : '',
+  ].filter(Boolean);
+  if (skipped.length > 0) {
+    lines.push(`// skipped ${skipped.join(', ')}; results may be incomplete.`);
+  }
+  return lines.length > 0 ? `\n\n${lines.join('\n')}` : '';
+}
+
+/** The `//` line saying a scan was cut short. */
+export function stoppedEarlyLine(stoppedReason: string): string {
+  const why = STOP_REASON_TEXT[stoppedReason] ?? `stopped (${stoppedReason})`;
+  return `// scan stopped early: ${why}. That total is a floor, not the count. Narrow path or pattern for the rest.`;
+}
+
+// Regex syntax literal code rarely holds: unspaced alternation (`a|b`, not
+// `||` or a `string | null` union), class escapes, and `.*` / `.+`. Bare `(`,
+// `.`, `[` stay out — `foo(` and `a.b` are ordinary literal needles. A Windows
+// path like `src\db` can still trip `\d`; the hint only shows on zero
+// matches, so a stray one costs one line.
+const REGEX_META = /(?<=[^\s|])\|(?=[^\s|])|\\[dDwWsSbB]|\.[*+]/;
+
+/**
+ * The `//` line explaining a zero-match result, or undefined. Without it a
+ * regex matched literally, or a glob that selected no files, reads exactly
+ * like a genuine miss (issue #55). An `incomplete` scan (files skipped or
+ * failed, scan stopped) already has its own line, which explains the zero
+ * better, so it gets no hint.
+ */
+export function zeroMatchHint(p: {
+  searchPattern: string;
+  isRegex: boolean;
+  pattern?: string | undefined;
+  filesScanned: number;
+  incomplete: boolean;
+}): string | undefined {
+  if (p.incomplete) return undefined;
+  if (p.filesScanned === 0) {
+    return p.pattern === undefined
+      ? '// no files were searched: nothing under path passed the hidden/ignored/maxDepth filters.'
+      : `// no files were searched: nothing under path matched pattern '${p.pattern}' after the hidden/ignored/maxDepth filters. pattern is a file-name glob; the text to find goes in searchPattern.`;
+  }
+  if (!p.isRegex && REGEX_META.test(p.searchPattern)) {
+    return '// searchPattern was matched as literal text but looks like a regex; pass isRegex=true to match it as one.';
+  }
+  return undefined;
+}

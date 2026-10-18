@@ -1,0 +1,554 @@
+// File reading pipeline split out of fs.ts. fs.ts imports from here; never the reverse.
+import { isUtf8 } from 'node:buffer';
+import { constants } from 'node:fs';
+import type { Stats } from 'node:fs';
+import type { FileHandle } from 'node:fs/promises';
+import { StringDecoder } from 'node:string_decoder';
+
+import { withAbort } from './concurrency.ts';
+import { ErrorCode, FsError, isFsError } from './errors.ts';
+import { hasUtf16Bom, isBinarySample, isKnownBinaryExtension, MIME_SAMPLE_SIZE } from './mime.ts';
+import { getMaxTextFileSize } from './util.ts';
+
+const STREAM_CHUNK_SIZE = 64 * 1024;
+
+// O_NOFOLLOW refuses (ELOOP) a final-component symlink, so a regular file
+// swapped for a symlink between validation and open is refused, not followed.
+// Opens receive the realpath-resolved target, so in-root symlinks still work.
+// Absent (undefined at runtime, despite @types/node) on Windows; 0 is a no-op.
+const { O_NOFOLLOW = 0, O_NONBLOCK = 0 } = constants as {
+  O_NOFOLLOW?: number;
+  O_NONBLOCK?: number;
+};
+export { O_NOFOLLOW };
+export const READ_NOFOLLOW = constants.O_RDONLY | O_NOFOLLOW;
+// O_NONBLOCK: an append to a symlink-swapped FIFO fails fast instead of hanging.
+export const APPEND_NOFOLLOW = constants.O_WRONLY | constants.O_APPEND | O_NOFOLLOW | O_NONBLOCK;
+export const APPEND_CREATE_NOFOLLOW =
+  constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_EXCL | O_NOFOLLOW;
+
+async function readProbe(handle: FileHandle, signal?: AbortSignal): Promise<Buffer> {
+  const buffer = Buffer.allocUnsafe(MIME_SAMPLE_SIZE);
+  const { bytesRead } = await withAbort(handle.read(buffer, 0, MIME_SAMPLE_SIZE, 0), signal);
+
+  if (bytesRead === 0) {
+    return Buffer.alloc(0);
+  }
+
+  return buffer.subarray(0, bytesRead);
+}
+
+export type ReadSpec =
+  | { kind: 'full'; signal?: AbortSignal; strictUtf8?: boolean }
+  | { kind: 'head'; lines: number; signal?: AbortSignal }
+  | { kind: 'tail'; lines: number; signal?: AbortSignal }
+  | { kind: 'range'; start: number; end?: number; signal?: AbortSignal };
+
+interface ReadOptions {
+  maxSize: number;
+  signal?: AbortSignal;
+}
+
+interface PartialReadResult {
+  content: string;
+  linesRead: number;
+  hasMoreLines: boolean;
+}
+
+export interface ReadFileResult {
+  path: string;
+  content: string;
+  fileSize?: number;
+  totalLines?: number;
+  readMode: ReadSpec['kind'];
+  modified: string;
+  head?: number;
+  tail?: number;
+  startLine?: number;
+  endLine?: number;
+  linesRead?: number;
+  hasMoreLines?: boolean;
+}
+
+/** `label` qualifies the size parenthetical; `suggestion` overrides the TOO_LARGE default remedy. */
+export function createTooLargeError(
+  bytesRead: number,
+  maxSize: number,
+  requestedPath: string,
+  { label, suggestion }: { label?: string; suggestion?: string } = {},
+): FsError {
+  return new FsError(
+    ErrorCode.TOO_LARGE,
+    `File exceeds size limit (${bytesRead} > ${maxSize} bytes${label ? `, ${label}` : ''})`,
+    requestedPath,
+    undefined,
+    suggestion,
+  );
+}
+
+export async function readFileBufferWithLimit(
+  handle: FileHandle,
+  maxSize: number,
+  requestedPath: string,
+  signal?: AbortSignal,
+): Promise<Buffer> {
+  // Node emits an already-aborted signal's AbortError twice: once to the
+  // iterator and once as an 'error' event no one listens to yet, which is
+  // an uncaught exception and shuts the server down. Throw it here instead.
+  signal?.throwIfAborted();
+  const stream = handle.createReadStream({
+    start: 0,
+    highWaterMark: STREAM_CHUNK_SIZE,
+    autoClose: false,
+    emitClose: false,
+    signal,
+  });
+
+  const chunks: Buffer[] = [];
+  let totalSize = 0;
+
+  try {
+    for await (const chunk of stream) {
+      const buffer = chunk as Buffer;
+      totalSize += buffer.length;
+
+      if (totalSize > maxSize) {
+        stream.destroy();
+        throw createTooLargeError(totalSize, maxSize, requestedPath);
+      }
+
+      chunks.push(buffer);
+    }
+  } finally {
+    if (!stream.destroyed) {
+      stream.on('error', (_err: unknown) => {
+        /* suppress post-destroy error event */
+      });
+      stream.destroy();
+    }
+  }
+
+  return Buffer.concat(chunks, totalSize);
+}
+
+export const countLines = (content: string): number => {
+  if (content.length === 0) return 0;
+  const trimmed = content.endsWith('\n') ? content.slice(0, -1) : content;
+  return trimmed.split('\n').length;
+};
+
+async function peekHasMore(iterator: AsyncIterator<string>): Promise<boolean> {
+  try {
+    const { done } = await iterator.next();
+    return !done;
+  } catch (error) {
+    // The peek only asks "is there another line", and the caller keeps nothing
+    // it returns. An over-long line past the requested range still answers yes
+    // — failing the whole read over a line outside it would reject e.g. lines
+    // 1-2 of a file whose line 3 is one 50 KB blob.
+    if (isFsError(error) && error.code === ErrorCode.TOO_LARGE) return true;
+    throw error;
+  }
+}
+
+const LF = 0x0a;
+
+/**
+ * Line iterator bounded by bytes rather than by the decoded string, so a file
+ * that is one enormous line cannot be materialized before the size check runs.
+ * `handle.readLines` decodes the whole line first and can OOM on such a file.
+ *
+ * Yields lines from `startLine` onward, 1-indexed. Lines before `startLine` are
+ * counted and discarded without decoding or accumulating, so an over-long line
+ * the caller skipped past does not fail the read. Line endings match
+ * `readLines`: split on `\n`, with a preceding `\r` stripped, so CRLF input
+ * decodes identically.
+ */
+async function* readLinesBounded(
+  handle: FileHandle,
+  options: ReadOptions,
+  filePath: string,
+  startLine: number,
+): AsyncGenerator<string, void, undefined> {
+  options.signal?.throwIfAborted(); // see readFileBufferWithLimit
+  const stream = handle.createReadStream({
+    start: 0,
+    highWaterMark: STREAM_CHUNK_SIZE,
+    autoClose: false,
+    emitClose: false,
+    ...(options.signal ? { signal: options.signal } : {}),
+  });
+
+  const decoder = new StringDecoder('utf-8');
+  let pending = '';
+  let pendingBytes = 0;
+  let lineNumber = 0;
+
+  const tooLong = (bytes: number): FsError =>
+    createTooLargeError(bytes, options.maxSize, filePath, {
+      label: 'single line',
+      suggestion: 'Use a narrower range or head.',
+    });
+
+  try {
+    for await (const chunk of stream) {
+      const buffer = chunk as Buffer;
+      let offset = 0;
+
+      // Search loop: each iteration finds the next LF and advances offset past
+      // it. Written as while-with-assignment so the re-search is visible, rather
+      // than buried in a for "increment" slot that re-runs indexOf.
+      let nl = buffer.indexOf(LF, offset);
+      while (nl !== -1) {
+        lineNumber++;
+        if (lineNumber >= startLine) {
+          const segment = buffer.subarray(offset, nl);
+          const lineBytes = pendingBytes + segment.length;
+          if (lineBytes > options.maxSize) throw tooLong(lineBytes);
+          // LF ends a character sequence as well as a line. Flush incomplete
+          // UTF-8 here instead of combining bytes from separate lines.
+          yield (pending + decoder.write(segment) + decoder.end()).replace(/\r$/, '');
+        }
+        pending = '';
+        pendingBytes = 0;
+        offset = nl + 1;
+        nl = buffer.indexOf(LF, offset);
+      }
+
+      const rest = buffer.subarray(offset);
+      pendingBytes += rest.length;
+      // Skipped lines never reach the decoder, so it is fresh when the first
+      // kept line starts, whichever chunk that is in.
+      if (lineNumber + 1 >= startLine) {
+        if (pendingBytes > options.maxSize) throw tooLong(pendingBytes);
+        pending += decoder.write(rest);
+      }
+    }
+
+    // Trailing line with no final newline. A file ending in `\n` leaves
+    // pendingBytes at 0 and emits nothing, matching readLines.
+    if (pendingBytes > 0) {
+      lineNumber++;
+      if (lineNumber >= startLine) {
+        if (pendingBytes > options.maxSize) throw tooLong(pendingBytes);
+        yield pending + decoder.end();
+      }
+    }
+  } finally {
+    if (!stream.destroyed) {
+      stream.on('error', (_err: unknown) => {
+        /* suppress post-destroy error event */
+      });
+      stream.destroy();
+    }
+  }
+}
+
+async function readRangeContent(
+  handle: FileHandle,
+  startLine: number,
+  endLine: number | undefined,
+  options: ReadOptions,
+  filePath: string,
+): Promise<PartialReadResult> {
+  options.signal?.throwIfAborted();
+
+  const lines: string[] = [];
+  let lineNumber = startLine - 1;
+  let estimatedBytes = 0;
+  const newlineBytes = Buffer.byteLength('\n', 'utf-8');
+  const stopAt = endLine ?? Number.POSITIVE_INFINITY;
+
+  let hasMoreLines = false;
+
+  // Byte-bounded: an over-long line throws TOO_LARGE while still a partial
+  // buffer, before it can be decoded into one huge string.
+  const iterator = readLinesBounded(handle, options, filePath, startLine)[Symbol.asyncIterator]();
+
+  try {
+    for (;;) {
+      const { value: line, done } = await iterator.next();
+      if (done) {
+        break;
+      }
+      lineNumber++;
+
+      if (lineNumber > stopAt) {
+        hasMoreLines = true;
+        break;
+      }
+
+      // join('\n') puts a separator only between lines, so the first costs none.
+      const lineBytes = Buffer.byteLength(line, 'utf-8') + (lines.length > 0 ? newlineBytes : 0);
+      if (lines.length > 0 && estimatedBytes + lineBytes > options.maxSize) {
+        hasMoreLines = true;
+        break;
+      }
+
+      lines.push(line);
+
+      estimatedBytes += lineBytes;
+      if (estimatedBytes > options.maxSize) {
+        hasMoreLines = await peekHasMore(iterator);
+        break;
+      }
+
+      if (lineNumber === stopAt) {
+        hasMoreLines = await peekHasMore(iterator);
+        break;
+      }
+    }
+  } finally {
+    await iterator.return();
+  }
+
+  return {
+    content: lines.join('\n'),
+    linesRead: lines.length,
+    hasMoreLines,
+  };
+}
+
+async function readTailContent(
+  handle: FileHandle,
+  tail: number,
+  options: ReadOptions,
+  filePath: string,
+): Promise<PartialReadResult> {
+  options.signal?.throwIfAborted();
+
+  const stats = await handle.stat();
+  const fileSize = stats.size;
+  if (fileSize === 0) {
+    return {
+      content: '',
+      linesRead: 0,
+      hasMoreLines: false,
+    };
+  }
+
+  const encoding = 'utf-8';
+  // Accumulate raw bytes from the end: decoding a chunk ending mid-codepoint
+  // corrupts the trailing UTF-8 sequence into U+FFFD. 0x0A is single-byte and
+  // never part of a multibyte sequence, so count newlines on the raw buffer and
+  // decode the whole bounded buffer once at the end.
+  let position = fileSize;
+  const chunks: Buffer[] = [];
+  let totalLen = 0;
+  let newlines = 0;
+  let stoppedByLimit = false;
+
+  while (position > 0) {
+    options.signal?.throwIfAborted();
+    const chunkSize = Math.min(position, STREAM_CHUNK_SIZE);
+    const buffer = Buffer.allocUnsafe(chunkSize);
+    const { bytesRead } = await handle.read(buffer, 0, chunkSize, position - chunkSize);
+    if (bytesRead < chunkSize) {
+      // The file shrank under us. Bytes from `position` on are still a
+      // contiguous suffix, so keep those and stop — splicing this short chunk in
+      // would leave a hole (and, with an alloc'd buffer, NULs) mid-content.
+      // `position` stays put, so the result is reported as having more lines.
+      break;
+    }
+    position -= chunkSize;
+
+    for (const byte of buffer) {
+      if (byte === 0x0a) newlines++;
+    }
+
+    chunks.unshift(buffer);
+    totalLen += chunkSize;
+
+    // One newline more than `tail`: the oldest segment in the buffer starts
+    // mid-line whenever we stop before the file start, and gets dropped below.
+    if (newlines > tail) break;
+    if (totalLen > options.maxSize) {
+      stoppedByLimit = true;
+      break;
+    }
+  }
+
+  const allBytes = Buffer.concat(chunks, totalLen);
+  let lines = allBytes.toString(encoding).split('\n');
+
+  // A trailing newline produces a spurious empty final segment; drop it.
+  if (lines.length > 0 && lines[lines.length - 1] === '') {
+    lines = lines.slice(0, -1);
+  }
+  // Normalize CRLF.
+  lines = lines.map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
+
+  // We stopped before the file start, so the first segment is the tail of a
+  // line whose beginning was never read. Drop it instead of reporting a
+  // fragment as a complete line.
+  if (position > 0 && lines.length > 0) {
+    lines = lines.slice(1);
+  }
+
+  if (stoppedByLimit && lines.length < tail) {
+    throw createTooLargeError(totalLen, options.maxSize, filePath, {
+      label: `could not collect ${tail} lines`,
+      suggestion: 'Use a narrower tail or head.',
+    });
+  }
+
+  let hasMoreLines = stoppedByLimit || position > 0;
+  if (lines.length > tail) {
+    hasMoreLines = true;
+    lines = lines.slice(lines.length - tail);
+  }
+
+  const content = lines.join('\n');
+  return {
+    content,
+    linesRead: lines.length,
+    hasMoreLines,
+  };
+}
+
+async function readFullContent(
+  handle: FileHandle,
+  maxSize: number,
+  requestedPath: string,
+  signal: AbortSignal | undefined,
+  strictUtf8: boolean,
+): Promise<{ content: string; totalLines: number }> {
+  const buffer = await readFileBufferWithLimit(handle, maxSize, requestedPath, signal);
+  // The binary probe samples only the first 512 bytes. A caller that writes the
+  // text back must refuse any byte the decode would replace with U+FFFD.
+  if (strictUtf8 && (!isUtf8(buffer) || buffer.includes(0))) {
+    throw new FsError(ErrorCode.INVALID_INPUT, 'Binary or non-UTF-8 file detected.', requestedPath);
+  }
+  const content = buffer.toString('utf-8');
+  return { content, totalLines: countLines(content) };
+}
+
+/** The text path's binary refusal; `read` matches it to offer `binary: true`. */
+export const BINARY_FILE_MESSAGE = 'Binary file detected.';
+
+export function isBinaryRefusal(error: unknown): error is FsError {
+  return (
+    error instanceof FsError &&
+    error.code === ErrorCode.INVALID_INPUT &&
+    error.message === BINARY_FILE_MESSAGE
+  );
+}
+
+async function assertNotBinary(
+  validPath: string,
+  filePath: string,
+  handle: FileHandle,
+  normalized: ReadOptions,
+): Promise<void> {
+  normalized.signal?.throwIfAborted();
+  if (isKnownBinaryExtension(validPath)) {
+    throw new FsError(ErrorCode.INVALID_INPUT, BINARY_FILE_MESSAGE, filePath);
+  }
+  const probe = await readProbe(handle, normalized.signal);
+  // A UTF-16 BOM passes the binary probe (it is text), but every reader
+  // here (read and edit) decodes UTF-8 and would hand back U+FFFD and NULs
+  // as content.
+  if (hasUtf16Bom(probe)) {
+    throw new FsError(
+      ErrorCode.INVALID_INPUT,
+      'UTF-16 text file detected; convert it to UTF-8 first.',
+      filePath,
+    );
+  }
+  if (isBinarySample(probe)) {
+    throw new FsError(ErrorCode.INVALID_INPUT, BINARY_FILE_MESSAGE, filePath);
+  }
+}
+
+async function readByMode(
+  handle: FileHandle,
+  validPath: string,
+  filePath: string,
+  stats: Stats,
+  spec: ReadSpec,
+  options: ReadOptions,
+): Promise<ReadFileResult> {
+  switch (spec.kind) {
+    case 'full': {
+      if (stats.size > options.maxSize) {
+        throw createTooLargeError(stats.size, options.maxSize, filePath, {
+          suggestion: 'Use head to preview.',
+        });
+      }
+      const { content, totalLines } = await readFullContent(
+        handle,
+        options.maxSize,
+        filePath,
+        options.signal,
+        spec.strictUtf8 === true,
+      );
+      return {
+        path: validPath,
+        readMode: 'full',
+        modified: stats.mtime.toISOString(),
+        fileSize: stats.size,
+        content,
+        totalLines,
+        linesRead: totalLines,
+        hasMoreLines: false,
+      };
+    }
+    case 'head':
+      return {
+        path: validPath,
+        readMode: 'head',
+        modified: stats.mtime.toISOString(),
+        fileSize: stats.size,
+        head: spec.lines,
+        ...(await readRangeContent(handle, 1, spec.lines, options, filePath)),
+      };
+    case 'range':
+      return {
+        path: validPath,
+        readMode: 'range',
+        modified: stats.mtime.toISOString(),
+        fileSize: stats.size,
+        startLine: spec.start,
+        ...(spec.end !== undefined ? { endLine: spec.end } : {}),
+        ...(await readRangeContent(handle, spec.start, spec.end, options, filePath)),
+      };
+    case 'tail':
+      return {
+        path: validPath,
+        readMode: 'tail',
+        modified: stats.mtime.toISOString(),
+        fileSize: stats.size,
+        tail: spec.lines,
+        ...(await readTailContent(handle, spec.lines, options, validPath)),
+      };
+  }
+}
+
+export function assertFileStats(filePath: string, stats: Stats): void {
+  if (!stats.isFile()) {
+    throw new FsError(ErrorCode.NOT_FILE, 'Not a regular file', filePath);
+  }
+}
+
+/** Read an already-validated, already-stat'd file per `spec`, opened via `openVerified`. */
+export async function readFileWithStats(
+  filePath: string,
+  validPath: string,
+  stats: Stats,
+  spec: ReadSpec,
+  openVerified: () => Promise<FileHandle>,
+): Promise<ReadFileResult> {
+  const options: ReadOptions = {
+    maxSize: getMaxTextFileSize(),
+    ...(spec.signal ? { signal: spec.signal } : {}),
+  };
+  spec.signal?.throwIfAborted();
+  assertFileStats(filePath, stats);
+
+  await using handle = await openVerified();
+
+  await assertNotBinary(validPath, filePath, handle, options);
+  spec.signal?.throwIfAborted();
+
+  return await readByMode(handle, validPath, filePath, stats, spec, options);
+}

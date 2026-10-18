@@ -1,0 +1,349 @@
+import type { ContentBlock } from '@modelcontextprotocol/server';
+
+import { randomUUID } from 'node:crypto';
+
+import { ErrorCode, FsError } from './errors.ts';
+import { jsonBytesOver, MIB } from './util.ts';
+
+// ─── TTL + LRU map ───────────────────────────────────────────────────────────
+
+/**
+ * A bounded, expiring map. `Map` keeps insertion order and a read re-inserts,
+ * so the first key is always the least recently used one. Entries carry an
+ * optional weight so a byte budget can be enforced next to the entry cap.
+ */
+class TtlLru<V> {
+  readonly #byKey = new Map<string, { value: V; expiresAt: number; weight: number }>();
+  readonly #maxEntries: number;
+  readonly #maxWeight: number;
+  readonly #ttlMs: number;
+  #weight = 0;
+
+  constructor(opts: { maxEntries: number; ttlMs: number; maxWeight?: number }) {
+    this.#maxEntries = opts.maxEntries;
+    this.#maxWeight = opts.maxWeight ?? Number.POSITIVE_INFINITY;
+    this.#ttlMs = opts.ttlMs;
+  }
+
+  /** Drop every expired entry; true when at least one went. */
+  prune(): boolean {
+    const now = Date.now();
+    const before = this.#byKey.size;
+    for (const [key, entry] of this.#byKey) {
+      if (entry.expiresAt <= now) this.delete(key);
+    }
+    return this.#byKey.size !== before;
+  }
+
+  /** The live value, bumped to most recently used; `undefined` when missing or expired. */
+  get(key: string): V | undefined {
+    const entry = this.#byKey.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= Date.now()) {
+      this.delete(key);
+      return undefined;
+    }
+    this.#byKey.delete(key);
+    this.#byKey.set(key, entry);
+    return entry.value;
+  }
+
+  /** Insert (pruning expired first) and evict least recently used entries past either cap. */
+  set(key: string, value: V, weight = 0): void {
+    this.prune();
+    this.delete(key);
+    this.#byKey.set(key, { value, expiresAt: Date.now() + this.#ttlMs, weight });
+    this.#weight += weight;
+    while (
+      this.#byKey.size > 0 &&
+      (this.#byKey.size > this.#maxEntries || this.#weight > this.#maxWeight)
+    ) {
+      const oldest = this.#byKey.keys().next();
+      if (oldest.done) break;
+      this.delete(oldest.value);
+    }
+  }
+
+  /** True when `key` was present. */
+  delete(key: string): boolean {
+    const entry = this.#byKey.get(key);
+    if (!entry) return false;
+    this.#weight -= entry.weight;
+    this.#byKey.delete(key);
+    return true;
+  }
+
+  /** Live keys, least recently used first. Prunes expired entries first. */
+  keys(): string[] {
+    this.prune();
+    return [...this.#byKey.keys()];
+  }
+
+  clear(): void {
+    this.#byKey.clear();
+    this.#weight = 0;
+  }
+}
+
+// ─── Resource store: externalized tool results ───────────────────────────────
+
+interface ResourceEntry {
+  uri: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  createdAt: string;
+  expiresAt: string;
+  text: string;
+}
+
+const MAX_ENTRIES = 64;
+const MAX_TOTAL_BYTES = 25 * MIB;
+const MAX_ENTRY_BYTES = 10 * MIB;
+const ENTRY_TTL_MS = 60 * 1000;
+
+/** The `resources/read` result that serves `entry`, and what the store measures it by. */
+export function entryReadResult(entry: ResourceEntry): {
+  contents: [{ uri: string; mimeType: string; text: string }];
+} {
+  return { contents: [{ uri: entry.uri, mimeType: entry.mimeType, text: entry.text }] };
+}
+
+interface ResourceStoreOptions {
+  /**
+   * Refuse an entry whose `resources/read` result encodes past this many
+   * bytes. stdio sets it: the entry is re-encoded there as one JSON string,
+   * where escaping can outgrow the bytes stored, and a link the connection
+   * can never carry back is worth no more than an entry over the cap.
+   */
+  readonly maxReadResultBytes?: number;
+}
+
+export class ResourceStore {
+  // Not readonly: a call view (`forCall`) shares its store's entries.
+  #entries = new TtlLru<ResourceEntry>({
+    maxEntries: MAX_ENTRIES,
+    maxWeight: MAX_TOTAL_BYTES,
+    ttlMs: ENTRY_TTL_MS,
+  });
+  readonly #onListChanged: (() => void) | undefined;
+  readonly #options: ResourceStoreOptions;
+  /** A call view's own puts; `undefined` on the store itself. */
+  #putUris: string[] | undefined;
+
+  constructor(onListChanged?: () => void, options: ResourceStoreOptions = {}) {
+    this.#onListChanged = onListChanged;
+    this.#options = options;
+  }
+
+  /**
+   * A view sharing this store's entries that also remembers the URIs put
+   * through it, so {@link discard} can take one tool call's entries back.
+   */
+  forCall(): ResourceStore {
+    const view = new ResourceStore(this.#onListChanged, this.#options);
+    view.#entries = this.#entries;
+    view.#putUris = [];
+    return view;
+  }
+
+  /**
+   * Drop what was put through this view and is still cached. The put already
+   * announced the list change (and may have pruned or evicted other entries),
+   * so taking the entry back is announced too.
+   */
+  discard(): void {
+    let dropped = false;
+    for (const uri of this.#putUris?.splice(0) ?? []) {
+      if (this.#entries.delete(uri)) dropped = true;
+    }
+    if (dropped) this.#onListChanged?.();
+  }
+
+  getEntry(uri: string): ResourceEntry {
+    const entry = this.#entries.get(uri);
+    if (entry) return entry;
+    // Not found and expired share a remedy; only the wording differs, and an
+    // expiry seen here changed the list a client may hold.
+    if (this.#entries.prune()) this.#onListChanged?.();
+    throw new FsError(
+      ErrorCode.NOT_FOUND,
+      `Resource not found: ${uri}. Re-run the tool to regenerate.`,
+    );
+  }
+
+  putText(params: { name: string; mimeType?: string; text: string }): ResourceEntry {
+    const entryBytes = Buffer.byteLength(params.text, 'utf8');
+    if (entryBytes > MAX_ENTRY_BYTES) {
+      throw this.#refuse(`Resource too large to cache (${entryBytes} bytes).`);
+    }
+    const now = Date.now();
+    const entry: ResourceEntry = {
+      uri: `filesystem-mcp://result/${randomUUID()}`,
+      name: params.name,
+      mimeType: params.mimeType ?? 'text/plain',
+      size: entryBytes,
+      createdAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + ENTRY_TTL_MS).toISOString(),
+      text: params.text,
+    };
+    const { maxReadResultBytes } = this.#options;
+    const readBytes =
+      maxReadResultBytes === undefined
+        ? undefined
+        : jsonBytesOver(entryReadResult(entry), maxReadResultBytes);
+    if (readBytes !== undefined) {
+      throw this.#refuse(`Resource too large to read back (${readBytes} bytes once JSON-encoded).`);
+    }
+    this.#entries.set(entry.uri, entry, entryBytes);
+    this.#putUris?.push(entry.uri);
+    this.#onListChanged?.();
+    return entry;
+  }
+
+  #refuse(message: string): FsError {
+    if (this.#entries.prune()) this.#onListChanged?.();
+    return new FsError(ErrorCode.TOO_LARGE, message);
+  }
+
+  /**
+   * Live URIs, oldest first. Deliberately silent about the prune it runs:
+   * this is the read path `resources/list` runs through, and the caller is
+   * already receiving the post-prune list.
+   */
+  keys(): string[] {
+    return this.#entries.keys();
+  }
+
+  clear(): void {
+    this.#entries.clear();
+  }
+}
+
+export interface JsonResourceResult {
+  entry: {
+    uri: string;
+    size: number;
+    mimeType: string;
+    expiresAt: string;
+  };
+  link: ContentBlock;
+}
+
+/**
+ * Owner of the externalize-a-payload rule: a tool whose inline response is
+ * truncated publishes the full value to the resource store as pretty-printed
+ * JSON and hands back the URI to reach it by, plus the link block that offers
+ * it to the user.
+ */
+export function putJsonResource(
+  store: ResourceStore,
+  name: string,
+  // `Record<string, unknown> | readonly unknown[]`, not `unknown` or `object`:
+  // JSON.stringify returns undefined for undefined and for functions, and `null`
+  // is excluded so non-string payloads cannot enter the store's text entry.
+  value: Record<string, unknown> | readonly unknown[],
+): JsonResourceResult {
+  const entry = store.putText({
+    name,
+    mimeType: 'application/json',
+    text: JSON.stringify(value, null, 2),
+  });
+
+  return {
+    entry: {
+      uri: entry.uri,
+      size: entry.size,
+      mimeType: entry.mimeType,
+      expiresAt: entry.expiresAt,
+    },
+    link: {
+      type: 'resource_link',
+      uri: entry.uri,
+      name: entry.name,
+      description: `Cached tool result; expires ${entry.expiresAt}`,
+      mimeType: entry.mimeType,
+      size: entry.size,
+      annotations: { audience: ['user'], lastModified: entry.createdAt },
+    },
+  };
+}
+
+// ─── Page snapshots: paginated result sets ───────────────────────────────────
+
+export interface PageSnapshot<T = unknown, M = unknown> {
+  readonly items: readonly T[];
+  readonly metadata: M;
+}
+
+/**
+ * The one cursor rejection: a cursor whose snapshot expired, was evicted, was
+ * already consumed past its end, or belongs to a different query. Every case
+ * has the same remedy, so they share one message.
+ */
+export function invalidCursor(): FsError {
+  return new FsError(
+    ErrorCode.INVALID_INPUT,
+    'Invalid cursor. Request the first page without a cursor.',
+  );
+}
+
+const MAX_SNAPSHOTS = 32;
+
+/**
+ * Short-lived snapshots of a completed query's full result set, so later pages
+ * slice a stored array instead of re-scanning and re-sorting the filesystem.
+ *
+ * ponytail: bounded by snapshot count and TTL, not by bytes — MAX_SNAPSHOTS x
+ * 20,000 `list` entries or MAX_SNAPSHOTS x 10,000 `search_text` matches, each
+ * match retaining up to 20 more line strings at `context: 10`, order of a few
+ * hundred MB held for 60s, and the HTTP leg shares one store so any caller can
+ * drive it. If that shows up as memory pressure, pass a byte weight to `set`
+ * the way `ResourceStore` does.
+ */
+export class PageSnapshotStore {
+  // Not readonly: a call view (`forCall`) shares its store's snapshots.
+  #byId = new TtlLru<PageSnapshot & { queryKey: string }>({
+    maxEntries: MAX_SNAPSHOTS,
+    ttlMs: ENTRY_TTL_MS,
+  });
+  /** A call view's own snapshots; `undefined` on the store itself. */
+  #createdIds: string[] | undefined;
+
+  /**
+   * A view sharing this store's snapshots that also remembers the ones
+   * created through it, so {@link discard} can take one tool call's back.
+   */
+  forCall(): PageSnapshotStore {
+    const view = new PageSnapshotStore();
+    view.#byId = this.#byId;
+    view.#createdIds = [];
+    return view;
+  }
+
+  /** Drop the snapshots created through this view. */
+  discard(): void {
+    for (const id of this.#createdIds?.splice(0) ?? []) this.#byId.delete(id);
+  }
+
+  create(params: { queryKey: string; items: readonly unknown[]; metadata?: unknown }): string {
+    const snapshotId = randomUUID();
+    this.#byId.set(snapshotId, {
+      queryKey: params.queryKey,
+      items: params.items,
+      metadata: params.metadata,
+    });
+    this.#createdIds?.push(snapshotId);
+    return snapshotId;
+  }
+
+  read<T, M = undefined>(snapshotId: string, queryKey: string): PageSnapshot<T, M> {
+    const entry = this.#byId.get(snapshotId);
+    if (entry?.queryKey !== queryKey) throw invalidCursor();
+    return { items: entry.items as readonly T[], metadata: entry.metadata as M };
+  }
+
+  clear(): void {
+    this.#byId.clear();
+  }
+}

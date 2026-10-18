@@ -1,0 +1,13 @@
+node_modules
+dist
+.git
+.github
+__tests__
+docs
+*.md
+!README.md
+Dockerfile
+.dockerignore
+eslint.config.mjs
+knip.json
+.prettierrc*

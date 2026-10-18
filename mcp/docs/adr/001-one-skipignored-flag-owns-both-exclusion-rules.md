@@ -1,0 +1,95 @@
+# ADR-001: One `skipIgnored` flag owns both exclusion rules a walk applies
+
+**Status**: accepted, 2026-09-11
+**Deciders**: j0hanz — settled on the arch-audit-six plan and merged as [#26](https://github.com/j0hanz/filesystem-mcp/pull/26)
+
+## Context
+
+Every file-walking tool exposes one input, `includeIgnored`, whose schema has a
+single owner, `IncludeIgnored` in
+[`schema.ts`](../../src/core/schema.ts). Its _meaning_ had none: the
+core walk took two separate options, `excludePatterns` and `respectGitignore`,
+and each of the four tools translated the one input into that pair itself.
+`list` translated it a third way — it passed `excludePatterns` but never
+`respectGitignore`, and post-filtered with its own gitignore matcher instead.
+
+An architecture audit found the two options were not independent in practice:
+across all five call sites `excludePatterns` only ever received
+`DEFAULT_EXCLUDE_PATTERNS` or `[]`, always selected by the same boolean that
+set `respectGitignore`. Two fields encoded one decision, and the tool that got
+the pair wrong was the one whose divergence the missing owner had produced.
+
+## Options
+
+- **Keep both fields; add a shared `walkOptionsFrom(args)` helper that owns the
+  translation** — its product is a new module wrapping a one-line expression,
+  and it leaves `excludePatterns` alive as configuration nothing configures.
+- **Delete `excludePatterns`, keep the name `respectGitignore`** — the
+  surviving flag also drops `node_modules`, `dist` and the rest of
+  `DEFAULT_EXCLUDE_PATTERNS`, so the name would describe half of what the flag
+  does; a flag whose name understates it is how the next caller justifies
+  reaching around it.
+- **Delete `excludePatterns` and rename the survivor to `skipIgnored`**
+  (chosen) — one field, one decision, and a name that covers both rules it now
+  selects.
+
+## Decision
+
+We will express "what a walk should not surface" as exactly one boolean,
+`skipIgnored`, on `GlobEntriesOptions` in
+[`glob.ts`](../../src/core/glob.ts) and on the search options that
+forward to it. `glob.ts` is the sole owner of what it means: `skipIgnored`
+selects the default excluded names (then `DEFAULT_EXCLUDE_PATTERNS`, now
+`DEFAULT_EXCLUDED_NAMES`) _and_ the `.gitignore` walk
+(`GitignoreManager.load`). Tools translate their public
+`includeIgnored` input into it and decide nothing further — the only form a
+call site may take is `skipIgnored: !args.includeIgnored`.
+
+Exclusion is applied by pruning the walk, never by filtering its output. A
+caller that post-filters is re-deriving the rule this record gives to `glob.ts`.
+
+## Consequences
+
+- A change to what a walk hides is now one edit in `glob.ts` rather than four,
+  and a new tool cannot get the pair half-right because there is no pair.
+- **Amended 2026-09-28:** a walk scoped below an allowed root also applies the
+  `.gitignore` files of its ancestors up to that root
+  (`GlobEntriesOptions.ignoreCeiling`, computed by
+  `PathGuard.allowedRootContaining`). The rules still live in `glob.ts`;
+  callers pass the ceiling and decide nothing further.
+- **The cost accepted: custom exclude patterns are no longer expressible.** The
+  old `excludePatterns` was a `readonly string[]` any caller could have filled
+  with arbitrary globs. None ever did, so nothing regressed — but a future
+  feature wanting per-call exclusions (a `--exclude` flag, a per-tool ignore
+  list) cannot add a pattern at the call site. It must either extend
+  `skipIgnored` into something richer or reintroduce a second field, and this
+  record is what that change has to argue with.
+- **Resolved 2026-09-26: A second cost, discovered after landing:** with the
+  array of patterns gone from the public option, `createExcludeFilter`'s
+  choice between returning a pattern array and returning a predicate
+  (now `createWalkFilter` in [`glob.ts`](../../src/core/glob.ts))
+  became invisible to callers — and the two are not equivalent. Node's
+  `fs.glob` drops a rejected entry given an array, but given a function it
+  prunes descent while still yielding the rejected dirent and any rejected
+  entry below the top level. The presence of a `.gitignore` anywhere under the
+  root silently switched modes. The guard, the `filter.isExcluded` re-check
+  in `processGlobPattern` ([`glob.ts`](../../src/core/glob.ts), the
+  `isExcluded` half of what `createWalkFilter` returns), makes the two forms
+  agree, and it is load-bearing for this decision: consolidating on one flag
+  is only safe while both branches of that filter mean the same thing.
+- Revisiting this means reintroducing a second field. Before doing so, check
+  whether the new case genuinely varies twice — the first version of this option
+  pair did not, which is what produced the finding.
+- **Amended 2026-09-26:** the array form is gone. `glob.ts` now applies both
+  rules (default excluded names and `.gitignore`) through one predicate,
+  `createWalkFilter`, which also prunes descent past `maxDepth`. The
+  array-vs-predicate divergence described above can no longer occur. The
+  defaults became a name set (`DEFAULT_EXCLUDED_NAMES`) matched per path
+  segment, which also excludes such a name below a dot-directory.
+- **Amended 2026-10-02:** the Decision's "only form a call site may take" rule
+  covers tools that translate their public `includeIgnored` input. An internal
+  walk that has no such input passes `skipIgnored: false`. The move protection
+  walk, `assertTreeHasNoProtectedEntries` in
+  [`move.ts`](../../src/tools/move.ts), is that kind of walk. It must
+  also see ignored and excluded trees, because a protected file under
+  `node_modules` or a `.gitignore`d path still changes status when moved.

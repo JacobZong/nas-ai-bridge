@@ -1,0 +1,6 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "entry": ["__tests__/**/*.test.ts"],
+  "project": ["src/**/*.ts", "__tests__/helpers.ts"],
+  "ignoreBinaries": ["pdftoppm", "ffmpeg", "antiword"]
+}

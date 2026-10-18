@@ -1,0 +1,188 @@
+import { styleText } from 'node:util';
+
+import packageJson from '../package.json' with { type: 'json' };
+import { MUTATING_TOOL_NAMES } from './tools/index.ts';
+
+// Help text and its rendering. Split out of cli.ts so that module holds only
+// argument parsing and directory validation: this file is static copy plus a
+// formatter, and shares no state with the parser.
+
+const { version: SERVER_VERSION } = packageJson;
+
+interface HelpRow {
+  flags: string;
+  desc: string;
+}
+
+const OPTIONS_HELP: HelpRow[] = [
+  { flags: '-h, --help', desc: 'Show this help message' },
+  { flags: '-v, --version', desc: 'Show the server version' },
+  { flags: '--allow-cwd', desc: 'Add the current working directory as an allowed root' },
+  {
+    flags: '--port <number>',
+    desc: 'Start HTTP transport on this port (env: FS_PORT)',
+  },
+  {
+    flags: '--read-only',
+    desc: `Disable write tools: ${[...MUTATING_TOOL_NAMES].sort().join(', ')} (env: FS_READ_ONLY)`,
+  },
+  { flags: '--print-config', desc: 'Print the active configuration as JSON and exit' },
+  {
+    flags: '--log-level <level>',
+    desc: 'Log level, RFC 5424: debug|info|notice|warn|error|critical|alert|emergency (env: FS_LOG_LEVEL)',
+  },
+  { flags: '--http-host <host>', desc: 'HTTP server bind address (env: FS_HTTP_HOST)' },
+  {
+    flags: '--api-key <key>',
+    desc: 'Require this API key on HTTP requests; prefer FS_API_KEY (argv is world-readable)',
+  },
+  {
+    flags: '--allow-sensitive',
+    desc: 'Turn off the built-in secret-file denylist (.env, keys, credentials) (env: FS_ALLOW_SENSITIVE)',
+  },
+  {
+    flags: '--root-boundary <path>',
+    desc: 'Require all allowed roots to fall under this path (env: FS_ROOT_BOUNDARY)',
+  },
+  {
+    flags: '--max-file-size <bytes>',
+    desc: 'Maximum file size for reads and for one create call, in bytes; the per-message wire limit is 3 × this + 1 MiB (env: FS_MAX_FILE_SIZE)',
+  },
+  {
+    flags: '--tool-timeout <ms>',
+    desc: 'Time limit for one list, stat, read, search or replace_text call, in ms (default 5000, 1000-600000) (env: FS_TOOL_TIMEOUT_MS)',
+  },
+  {
+    flags: '--walk-cwd',
+    desc: 'Walk up from CWD to find a project root; implies --allow-cwd (env: FS_ALLOW_CWD_WALK)',
+  },
+  {
+    flags: '--deny <pattern>',
+    desc: 'Block paths matching this pattern; repeatable (env: FS_DENYLIST)',
+  },
+  {
+    flags: '--allow <pattern>',
+    desc: 'Exempt a pattern from the built-in sensitive denylist; repeatable (env: FS_ALLOWLIST)',
+  },
+  {
+    flags: '--allow-missing-roots',
+    desc: 'Start even if configured allowed directories do not exist (env: FS_ALLOW_MISSING_ROOTS)',
+  },
+];
+
+const ENV_HELP: HelpRow[] = [
+  {
+    flags: 'FS_LOG_LEVEL',
+    desc: 'Log level, RFC 5424: debug|info|notice|warn|error|critical|alert|emergency',
+  },
+  { flags: 'FS_PORT', desc: 'Start HTTP transport on this port (unset = stdio)' },
+  { flags: 'FS_HTTP_HOST', desc: 'HTTP bind address' },
+  { flags: 'FS_API_KEY', desc: 'HTTP API key' },
+  {
+    flags: 'FS_TRUST_PROXY',
+    desc: 'Express trust-proxy setting: hop count or expression (unset = do not trust X-Forwarded-*)',
+  },
+  {
+    flags: 'FS_ALLOW_SENSITIVE',
+    desc: 'Turn off the built-in secret-file denylist ("true" or "1" enables this)',
+  },
+  { flags: 'FS_ROOT_BOUNDARY', desc: 'Path prefix all allowed roots must fall under' },
+  {
+    flags: 'FS_MAX_FILE_SIZE',
+    desc: 'Maximum file size for reads and for one create call, in bytes; sizes the wire limit (3 × this + 1 MiB)',
+  },
+  {
+    flags: 'FS_TOOL_TIMEOUT_MS',
+    desc: 'Time limit for one list, stat, read, search or replace_text call, in ms (default 5000, 1000-600000)',
+  },
+  {
+    flags: 'FS_ALLOWED_DIRS',
+    desc: 'Allowed dirs: colon-separated (Unix), semicolon-separated (Windows)',
+  },
+  {
+    flags: 'FS_ALLOW_CWD_WALK',
+    desc: 'Walk up from CWD to find a project root ("true" or "1" enables this)',
+  },
+  { flags: 'FS_DENYLIST', desc: 'Paths/patterns to block, comma-separated' },
+  {
+    flags: 'FS_ALLOWLIST',
+    desc: 'Patterns exempted from the built-in sensitive denylist, comma-separated; --deny/FS_DENYLIST still win',
+  },
+  {
+    flags: 'FS_ALLOW_MISSING_ROOTS',
+    desc: 'Start even if configured allowed directories do not exist ("true" or "1" enables this)',
+  },
+  { flags: 'FS_READ_ONLY', desc: 'Disable write tools ("true" or "1" enables this)' },
+  {
+    flags: 'FS_ALLOWED_HOSTS',
+    desc: 'Comma-separated Host header values to accept (HTTP transport)',
+  },
+  {
+    flags: 'FS_ALLOWED_ORIGINS',
+    desc: 'Comma-separated origin hostnames for CORS; an extension ID or a lowercase <scheme>://* entry (e.g. moz-extension://*) admits browser extensions',
+  },
+  {
+    flags: 'FS_ALLOW_UNRESTRICTED_HOSTS',
+    desc: 'Bind a wildcard host with no Host validation, accepts the risk ("true" or "1" enables this)',
+  },
+  { flags: 'FS_PUBLIC_URL', desc: 'Resource identifier URL for RFC 9728 discovery' },
+  {
+    flags: 'FS_RATE_LIMIT_RPM',
+    desc: 'Per-client-IP requests/min (default 120 authenticated, 6000 keyless loopback; 1–100000)',
+  },
+  {
+    flags: 'FS_MAX_WATCHERS',
+    desc: 'Max concurrent file watchers (default 256, 1–4096)',
+  },
+  { flags: 'NO_COLOR', desc: 'Any value disables ANSI color output' },
+  {
+    flags: 'FS_REQUEST_STATE_KEY',
+    desc: 'HMAC key for input_required state; optional, >=32 bytes when set',
+  },
+];
+
+const EXAMPLES_HELP = [
+  '$ filesystem-mcp /path/to/allowed/dir',
+  '$ filesystem-mcp --allow-cwd',
+  '$ filesystem-mcp /project/src /project/tests --allow-cwd',
+  '$ filesystem-mcp --port 3000 /path/to/allowed/dir',
+  '$ filesystem-mcp --read-only /data/readonly',
+  '$ filesystem-mcp --print-config /project',
+];
+
+export function printHelpAndExit(): never {
+  // Sized from the longest name so a long one (FS_ALLOW_UNRESTRICTED_HOSTS)
+  // never runs into its description.
+  const COL = Math.max(...[...OPTIONS_HELP, ...ENV_HELP].map(({ flags }) => flags.length)) + 2;
+  // Pad first, colour after: `styleText` honours NO_COLOR, and padding the
+  // plain text keeps the columns aligned whether or not colour is on.
+  const row = (color: 'green' | 'cyan', name: string, desc: string): string =>
+    `  ${styleText(color, name.padEnd(COL))}${desc}`;
+  const dim = (t: string): string => styleText('dim', t);
+  const section = (t: string): string => styleText(['cyan', 'bold'], t);
+
+  const lines = [
+    '',
+    `${styleText('bold', 'Filesystem MCP')} ${dim(`v${SERVER_VERSION}`)}`,
+    '',
+    dim('Pass one or more directories to set the allowed access roots.'),
+    '',
+    section('Options:'),
+    ...OPTIONS_HELP.map(({ flags, desc }) => row('green', flags, desc)),
+    '',
+    `${section('Environment variables:')} ${dim('(flags win when both are set; --deny/--allow add to FS_DENYLIST/FS_ALLOWLIST)')}`,
+    ...ENV_HELP.map(({ flags, desc }) => row('cyan', flags, desc)),
+    '',
+    section('Examples:'),
+    ...EXAMPLES_HELP.map((ex) => `  ${dim(ex)}`),
+    '',
+  ];
+
+  process.stdout.write(lines.join('\n'));
+  process.exit(0);
+}
+
+export function printVersionAndExit(): never {
+  process.stdout.write(`${styleText('cyan', SERVER_VERSION)}\n`);
+  process.exit(0);
+}

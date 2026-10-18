@@ -1,0 +1,380 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+      custom_version:
+        description: 'Custom version (overrides bump, e.g. 2.0.0-beta.1)'
+        required: false
+        type: string
+
+# Least privilege: each job below declares what it needs.
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  # ─────────────────────────────────────────
+  # 1. Bump versions, validate, tag & release
+  # ─────────────────────────────────────────
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      # Read the CI check runs of the commit being released.
+      checks: read
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Push with the deploy key: the main-branch ruleset lets only this
+          # key (and the repository admin) update main without a PR (plan 064).
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+
+      # The publish step pushes HEAD to main, so a dispatch from any other
+      # branch would fast-forward main onto that branch's tip.
+      - name: Require dispatch on main
+        run: |
+          if [ "$GITHUB_REF_NAME" != "main" ]; then
+            echo "::error::Release must be dispatched on main (got $GITHUB_REF_NAME)"
+            exit 1
+          fi
+
+      # The release re-runs the checks on Ubuntu only. This reads the CI result for
+      # the exact commit being released, so a red or unfinished Windows leg (or a
+      # commit whose CI never ran) cannot ship.
+      # Only check runs from the GitHub Actions app (id 15368) count.
+      - name: Require green CI for this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUIRED: 'Check (ubuntu-latest)|Check (windows-latest)|Release build paths'
+        run: |
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" \
+            --jq '.check_runs | map(select(.app.id == 15368)) | sort_by(.id) | reverse | .[] | [.name, .status, (.conclusion // "none")] | @tsv')
+          fail=0
+          IFS='|' read -ra names <<< "$REQUIRED"
+          for name in "${names[@]}"; do
+            line=$(printf '%s\n' "$runs" | awk -F'\t' -v n="$name" '$1 == n' | head -n1)
+            if [ -z "$line" ]; then
+              echo "::error::No '$name' check run for $GITHUB_SHA — CI has not run on this commit"
+              fail=1
+            elif [ "$(printf '%s' "$line" | cut -f2)" != "completed" ]; then
+              echo "::error::'$name' is still $(printf '%s' "$line" | cut -f2) for $GITHUB_SHA — wait for CI"
+              fail=1
+            elif [ "$(printf '%s' "$line" | cut -f3)" != "success" ]; then
+              echo "::error::'$name' concluded $(printf '%s' "$line" | cut -f3) for $GITHUB_SHA"
+              fail=1
+            else
+              echo "ok: $name"
+            fi
+          done
+          exit "$fail"
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Determine version
+        id: ver
+        env:
+          CUSTOM_VERSION: ${{ inputs.custom_version }}
+          BUMP: ${{ inputs.bump }}
+        run: |
+          CURRENT=$(node -p "require('./package.json').version")
+          if [ -n "$CUSTOM_VERSION" ]; then
+            NEW="$CUSTOM_VERSION"
+          else
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+            case "$BUMP" in
+              major) NEW="$((MAJOR + 1)).0.0" ;;
+              minor) NEW="$MAJOR.$((MINOR + 1)).0" ;;
+              patch) NEW="$MAJOR.$MINOR.$((PATCH + 1))" ;;
+            esac
+          fi
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "### Version: $CURRENT → $NEW" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bump package.json, server.json, MCPB and plugin manifests
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+
+          const path = 'server.json';
+          const data = JSON.parse(fs.readFileSync(path, 'utf8'));
+
+          data.version = process.env.VERSION;
+
+          if (Array.isArray(data.packages)) {
+            for (const pkg of data.packages) {
+              if (pkg && typeof pkg === 'object') {
+                if (pkg.registryType === 'oci') {
+                  const idBase = pkg.identifier.split(':')[0];
+                  pkg.identifier = `${idBase}:${process.env.VERSION}`;
+                  delete pkg.version;
+                } else {
+                  pkg.version = process.env.VERSION;
+                }
+              }
+            }
+          }
+
+          fs.writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`);
+
+          // String replace keeps Prettier's layout; the first "version" key is top-level.
+          for (const manifestPath of [
+            'mcpb/manifest.json',
+            '.codex-plugin/plugin.json',
+            '.cursor-plugin/plugin.json',
+          ]) {
+            const manifest = fs.readFileSync(manifestPath, 'utf8');
+            fs.writeFileSync(
+              manifestPath,
+              manifest.replace(/"version": "[^"]*"/, `"version": "${process.env.VERSION}"`),
+            );
+          }
+          NODE
+          npm install --package-lock-only --ignore-scripts
+
+      - name: Install & validate
+        run: |
+          npm ci --ignore-scripts
+          npm run check
+
+      - name: Release-only build paths (Docker, MCPB, Smithery dry run)
+        run: bash scripts/check-release-paths.sh
+
+      - name: Commit, tag & push
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          git add package.json package-lock.json server.json mcpb/manifest.json .codex-plugin/plugin.json .cursor-plugin/plugin.json
+          git commit -m "release: v$VERSION"
+          git tag -a "v$VERSION" -m "v$VERSION"
+          git push --atomic origin main --follow-tags
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: gh release create "v$VERSION" --title "v$VERSION" --generate-notes
+
+  # ─────────────────────────────────────────
+  # 2. Publish to npm
+  # ─────────────────────────────────────────
+  publish-npm:
+    name: npm
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: v${{ needs.release.outputs.version }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install & build
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+
+      - name: Publish
+        run: |
+          npm publish --access public --provenance --ignore-scripts || {
+            if npm view "@j0hanz/filesystem-mcp@$VERSION" version 2>/dev/null; then
+              echo "::notice::v$VERSION already on npm — skipped"
+            else
+              exit 1
+            fi
+          }
+
+      - name: Summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## 📦 Published to npm
+          | | |
+          |---|---|
+          | **Package** | [\`@j0hanz/filesystem-mcp@$VERSION\`](https://www.npmjs.com/package/@j0hanz/filesystem-mcp) |
+          | **Auth** | Trusted Publishing (OIDC) |
+          | **Provenance** | ✓ |
+          EOF
+
+  # ─────────────────────────────────────────
+  # 3. Build & push Docker image
+  # ─────────────────────────────────────────
+  publish-docker:
+    name: Docker
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: v${{ needs.release.outputs.version }}
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value=v${{ needs.release.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ needs.release.outputs.version }}
+            type=semver,pattern={{major}},value=v${{ needs.release.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build & push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## 🐳 Docker Image Published
+          | | |
+          |---|---|
+          | **Image** | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$VERSION\` |
+          | **Platforms** | linux/amd64, linux/arm64 |
+          EOF
+
+  # ─────────────────────────────────────────
+  # 4. Publish to MCP Registry
+  # ─────────────────────────────────────────
+  publish-mcp:
+    name: MCP Registry
+    needs: [release, publish-npm, publish-docker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: v${{ needs.release.outputs.version }}
+
+      - name: Publish
+        env:
+          MCP_PUBLISHER_VERSION: v1.8.1
+          MCP_PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
+        run: |
+          # Pinned + verified: this job holds id-token:write, so an unreviewed
+          # "latest" binary must never run here. Bump the two env values together.
+          curl -fsSL -o mcp-publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tar.gz" | sha256sum -c -
+          tar xzf mcp-publisher.tar.gz mcp-publisher
+          chmod +x mcp-publisher
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish
+
+      - name: Summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## 🟡 Published to MCP Registry
+          | | |
+          |---|---|
+          | **Server** | \`io.github.j0hanz/filesystem-mcp@$VERSION\` |
+          | **Registry** | [registry.modelcontextprotocol.io](https://registry.modelcontextprotocol.io) |
+          EOF
+
+  # ─────────────────────────────────────────
+  # 5. Desktop extension bundle (.mcpb)
+  # ─────────────────────────────────────────
+  publish-mcpb:
+    name: MCPB
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: v${{ needs.release.outputs.version }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+
+      - name: Pack
+        run: |
+          npm ci --ignore-scripts
+          bash scripts/pack-mcpb.sh
+
+      - name: Attach to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "v$VERSION" filesystem-mcp.mcpb --clobber
+
+      - name: Publish to Smithery
+        env:
+          SMITHERY_API_KEY: ${{ secrets.SMITHERY_API_KEY }}
+        run: node scripts/publish-smithery.mjs
+
+      - name: Summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## 🧩 Desktop extension
+          | | |
+          |---|---|
+          | **Bundle** | [\`filesystem-mcp.mcpb\`](https://github.com/${{ github.repository }}/releases/download/v$VERSION/filesystem-mcp.mcpb) |
+          EOF
