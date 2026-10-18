@@ -1,6 +1,6 @@
 """Generate tiny, license-free fixtures for the NAS integration test.
 
-Usage: python3 .nas/make_fixtures.py <out_dir> <image>
+Usage: python3 tests/make_fixtures.py <out_dir> <image>
 The video is produced with the candidate image's own ffmpeg, so the runner
 needs nothing but Docker and Python.
 """

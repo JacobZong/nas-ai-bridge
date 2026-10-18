@@ -1,0 +1,10 @@
+# Vultr /opt/frp/frps.toml (systemd frps). Replace the token on the server only.
+# ufw opens 22, 80, 443, 7000; 36892, 36893 and 18080 stay closed (nginx reaches frps on 127.0.0.1).
+bindPort = 7000
+auth.method = "token"
+auth.token = "<FRP_AUTH_TOKEN>"
+transport.tls.force = true
+allowPorts = [
+  { single = 36892 },
+  { single = 36893 }
+]

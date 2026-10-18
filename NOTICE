@@ -1,0 +1,6 @@
+nas-ai-bridge includes or builds on the following MIT-licensed projects:
+
+- filesystem-mcp, Copyright (c) j0hanz — https://github.com/j0hanz/filesystem-mcp
+  Source vendored under mcp/ with its original LICENSE.
+- Xberg, Copyright (c) xberg-io — https://github.com/xberg-io/xberg
+  Used as the base image of converter/ (no source copied).

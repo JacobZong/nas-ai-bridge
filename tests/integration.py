@@ -1,6 +1,6 @@
 """End-to-end check of a candidate image against the real Xberg converter.
 
-Usage: python3 .nas/integration.py <candidate_image> <fixtures_dir> [xberg_image]
+Usage: python3 tests/integration.py <mcp_image> <fixtures_dir> [converter_image]
 Runs both containers the way the NAS does (read-only root, cap_drop ALL,
 uid 1000, converter on an internal network), then exercises the three
 document tools and the read-only guarantee over MCP/HTTP. Exit 1 on failure.

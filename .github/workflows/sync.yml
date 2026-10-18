@@ -1,0 +1,122 @@
+# One pipeline for both images.
+#   schedule / manual: pull the latest upstream filesystem-mcp release into mcp/
+#     and the latest Xberg core digest into converter/Dockerfile, then test.
+#     Publish only when something changed (or force_publish), and only if every test passed.
+#   pull_request / push: same tests, never publishes.
+# A failed run means nothing was published; GitHub emails the owner.
+name: Sync, test and publish
+
+on:
+  schedule:
+    - cron: '0 18 * * *' # 03:00 JST
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: 'Publish both images even without upstream changes'
+        type: boolean
+        default: false
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: sync-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  MCP_IMAGE: ghcr.io/jacobzong/nas-ai-bridge-mcp
+  CONVERTER_IMAGE: ghcr.io/jacobzong/nas-ai-bridge-converter
+  SOURCE_URL: https://github.com/${{ github.repository }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Pull upstream releases
+        id: upstream
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          changed=false
+
+          latest=$(gh release view -R j0hanz/filesystem-mcp --json tagName -q .tagName)
+          current=$(cat upstream/filesystem-mcp.version)
+          echo "filesystem-mcp upstream=$latest merged=$current"
+          if [ "$latest" != "$current" ]; then
+            if ! git subtree pull --prefix=mcp https://github.com/j0hanz/filesystem-mcp.git "refs/tags/$latest" \
+                 -m "chore: merge upstream filesystem-mcp $latest into mcp/"; then
+              git merge --abort || true
+              echo "::error::Merge conflict with filesystem-mcp $latest. Nothing was published; merge by hand in a PR."
+              exit 1
+            fi
+            echo "$latest" > upstream/filesystem-mcp.version
+            git add upstream/filesystem-mcp.version
+            git commit -m "chore: record filesystem-mcp $latest"
+            changed=true
+          fi
+
+          new_digest=$(docker buildx imagetools inspect ghcr.io/xberg-io/xberg:core --format '{{json .Manifest}}' | jq -r .digest)
+          cur_digest=$(sed -n 's/^FROM ghcr.io\/xberg-io\/xberg:core@\(sha256:[0-9a-f]*\)$/\1/p' converter/Dockerfile)
+          echo "xberg core latest=$new_digest pinned=$cur_digest"
+          if [ -n "$new_digest" ] && [ "$new_digest" != "$cur_digest" ]; then
+            sed -i "s|^FROM ghcr.io/xberg-io/xberg:core@sha256:[0-9a-f]*$|FROM ghcr.io/xberg-io/xberg:core@$new_digest|" converter/Dockerfile
+            git add converter/Dockerfile
+            git commit -m "chore: bump Xberg core to $new_digest"
+            changed=true
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: mcp/package-lock.json
+
+      - name: Install poppler and ffmpeg for the document tool tests
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils ffmpeg
+
+      - name: Test the MCP source
+        working-directory: mcp
+        run: |
+          npm ci --ignore-scripts
+          npm run check
+
+      - name: Build candidate images
+        run: |
+          docker build --label "org.opencontainers.image.source=$SOURCE_URL" -t mcp-candidate mcp
+          docker build -t converter-candidate converter
+
+      - name: Integration test (both candidates together, as on the NAS)
+        run: |
+          python3 tests/make_fixtures.py "$RUNNER_TEMP/fixtures" mcp-candidate
+          python3 tests/integration.py mcp-candidate "$RUNNER_TEMP/fixtures" converter-candidate
+
+      - name: Publish both images and push main
+        if: github.ref == 'refs/heads/main' && (steps.upstream.outputs.changed == 'true' || inputs.force_publish)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          sha=$(git rev-parse HEAD)
+          for pair in "mcp-candidate $MCP_IMAGE" "converter-candidate $CONVERTER_IMAGE"; do
+            set -- $pair
+            docker tag "$1" "$2:nas"
+            docker tag "$1" "$2:nas-$sha"
+            docker push "$2:nas"
+            docker push "$2:nas-$sha"
+          done
+          git push origin HEAD:main
+          {
+            echo "### Published nas-$sha"
+            echo "- filesystem-mcp $(cat upstream/filesystem-mcp.version)"
+            echo "- $(grep '^FROM' converter/Dockerfile)"
+          } >> "$GITHUB_STEP_SUMMARY"

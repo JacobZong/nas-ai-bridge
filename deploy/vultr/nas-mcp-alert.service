@@ -1,0 +1,8 @@
+[Unit]
+Description=Mail NAS MCP gate login/grant activity
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/nas-mcp-alert/env
+ExecStart=/usr/bin/python3 /opt/nas-mcp-alert/nas-mcp-alert.py

@@ -1,0 +1,23 @@
+# NAS frpc (docker/frpc/, network_mode: host, frp 0.57.0).
+# The token comes from docker/frpc/.env (FRP_AUTH_TOKEN), never from this file.
+serverAddr = "nas.hisamori.app"
+serverPort = 7000
+auth.method = "token"
+auth.token = "{{ .Envs.FRP_AUTH_TOKEN }}"
+transport.tcpMux = true
+transport.tls.enable = true
+transport.poolCount = 5
+
+[[proxies]]
+name = "webdav"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 5006
+remotePort = 36892
+
+[[proxies]]
+name = "nas-file-mcp"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 3001
+remotePort = 36893

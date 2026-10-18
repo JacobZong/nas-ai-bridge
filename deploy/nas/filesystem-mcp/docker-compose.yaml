@@ -1,0 +1,102 @@
+# NAS: docker/filesystem-mcp/docker-compose.yaml (template; secrets only in .env next to it).
+# Images are built and published by this repo's sync workflow:
+#   :nas floats to the latest tested build; :nas-<commit> pins one for rollback.
+services:
+  filesystem-mcp:
+    image: ghcr.io/jacobzong/nas-ai-bridge-mcp:nas
+    container_name: filesystem-mcp
+    restart: unless-stopped
+    init: true
+    user: "1000:1000"   # file access is decided by the NAS account ai-mcp over SMB
+    ports:
+      - "3001:3000"
+    environment:
+      TZ: Asia/Tokyo
+      FS_PORT: "3000"
+      FS_HTTP_HOST: "0.0.0.0"
+      FS_ALLOW_UNRESTRICTED_HOSTS: "true"
+      FS_API_KEY: "${FS_API_KEY:?FS_API_KEY missing in .env}"
+      FS_ROOT_BOUNDARY: "/data"
+      FS_DENYLIST: "/data/read/docker,/data/read/docker/**,/data/read/@*,/data/read/@*/**"
+      FS_CONVERTER_URL: "http://converter:8000"
+      FS_INDEX_DIR: "/index"
+    command: ["/data/read", "/data/write"]
+    volumes:
+      # Read: one read-only SMB volume per share granted to ai-mcp
+      - type: volume
+        source: ai-read-10tools
+        target: /data/read/10 Tools
+        read_only: true
+      - type: volume
+        source: ai-read-20learning
+        target: /data/read/20 Learning
+        read_only: true
+      - type: volume
+        source: ai-read-30media
+        target: /data/read/30 Media
+        read_only: true
+      # Write: only AI回寫, over the NAS's own SMB so deletes land in #recycle
+      - type: volume
+        source: ai-write-smb-v3
+        target: /data/write
+      # locate filename index (survives restarts, rebuilt daily at 04:00)
+      - type: volume
+        source: fs-index
+        target: /index
+    networks: [default, converter]
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # Converter: receives file bytes from filesystem-mcp only; no folders, no ports, no internet
+  converter:
+    image: ghcr.io/jacobzong/nas-ai-bridge-converter:nas
+    container_name: filesystem-mcp-converter
+    restart: unless-stopped
+    init: true
+    environment: { TZ: Asia/Tokyo, RUST_LOG: warn, XBERG_CORS_ORIGINS: "http://filesystem-mcp" }
+    networks: [converter]
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+      - /app/.xberg:size=256m,uid=1000,gid=1000
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 2g
+    cpus: 2
+
+networks:
+  converter:
+    internal: true
+
+volumes:
+  fs-index:
+  ai-write-smb-v3:
+    driver: local
+    driver_opts:
+      type: cifs
+      device: "//127.0.0.1/AI回寫"
+      o: "username=${NAS_SMB_USER:?NAS_SMB_USER missing in .env},password=${NAS_SMB_PASSWORD:?NAS_SMB_PASSWORD missing in .env},uid=1000,gid=1000,file_mode=0664,dir_mode=0775,vers=3.0,iocharset=utf8,nobrl"
+  ai-read-10tools:
+    driver: local
+    driver_opts:
+      type: cifs
+      device: "//127.0.0.1/10 Tools"
+      o: "ro,username=${NAS_SMB_USER:?NAS_SMB_USER missing in .env},password=${NAS_SMB_PASSWORD:?NAS_SMB_PASSWORD missing in .env},uid=1000,gid=1000,file_mode=0444,dir_mode=0555,vers=3.0,iocharset=utf8,nobrl"
+  ai-read-20learning:
+    driver: local
+    driver_opts:
+      type: cifs
+      device: "//127.0.0.1/20 Learning"
+      o: "ro,username=${NAS_SMB_USER:?NAS_SMB_USER missing in .env},password=${NAS_SMB_PASSWORD:?NAS_SMB_PASSWORD missing in .env},uid=1000,gid=1000,file_mode=0444,dir_mode=0555,vers=3.0,iocharset=utf8,nobrl"
+  ai-read-30media:
+    driver: local
+    driver_opts:
+      type: cifs
+      device: "//127.0.0.1/30 Media"
+      o: "ro,username=${NAS_SMB_USER:?NAS_SMB_USER missing in .env},password=${NAS_SMB_PASSWORD:?NAS_SMB_PASSWORD missing in .env},uid=1000,gid=1000,file_mode=0444,dir_mode=0555,vers=3.0,iocharset=utf8,nobrl"
